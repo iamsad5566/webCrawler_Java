@@ -1,6 +1,8 @@
 import java.io.File;
+import java.io.IOError;
 import java.io.IOException;
 import java.util.*;
+import java.util.NoSuchElementException;
 import java.util.concurrent.TimeUnit;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
@@ -33,11 +35,8 @@ public class Crawler {
 
         // Set the pathway of the chromedriver.exe and create a driver
         String path = System.getProperty("user.dir");
-        System.setProperty("webdriver.chrome.driver", path + "/chromedriver.exe");
+        System.setProperty("webdriver.chrome.driver", path + "/chromedriver");
         WebDriver driver = new ChromeDriver();
-
-        // List 存放受試者費代墊
-        var list_experiment = browser_experiment(driver, thisMonth, lastMonth);
 
         // Add the sheets
         Sheet first = wb.createSheet("各類所得（受試者費）");
@@ -45,17 +44,18 @@ public class Crawler {
         Sheet third = wb.createSheet("受試者費以外的支出");
         Sheet fourth = wb.createSheet("個人當月代墊總和");
 
-        // Build the first sheet
-        buildSheet1(list_experiment, first);
-
         // 移到報帳管理，建立sheet2
         var list_funding = browser_funding(driver, thisMonth, lastMonth);
 
+        // Build the first sheet
+        buildSheet1(list_funding, first);
+
         // Build the second sheet
-        buildSheet2(list_funding, second);
+        buildSheet2(list_funding, second, first);
 
         // Build the third sheet，計算實驗室該月除了受試者費外的支出
         buildSheet3(first, second, third);
+
         // 計算每個人當月代墊
         buildSheet4(first, third, fourth);
 
@@ -105,7 +105,7 @@ public class Crawler {
         return year+month;
     }
 
-    public static List<String> browser_experiment(WebDriver driver, String thisMoth, String lastMonth) {
+    public static List<String> browser_funding(WebDriver driver, String thisMonth, String lastMonth) throws InterruptedException, IOException, NoSuchElementException {
         // Direct to NTU web
         driver.get("https://ntuacc.cc.ntu.edu.tw/acc/index.asp?campno=m&idtype=3");
         // Let's Login
@@ -114,39 +114,10 @@ public class Crawler {
         driver.findElement(new By.ByXPath("//*[@id=\"asspwd\"]")).sendKeys("");
         driver.findElement(new By.ByXPath("//*[@id=\"vsub\"]/td/input")).click();
 
-        // Navigate to 各類所得
-        driver.navigate().to("https://ntuacc.cc.ntu.edu.tw/acc/salary/variousal.asp");
+        String targetYear = thisMonth.substring(0, 3);
 
-        // List to return
-        var list = new ArrayList<String>();
-
-        // Get all in a month
-        outer:for(;;) {
-            var tr_tag = driver.findElements(By.tagName("tr"));
-            for(WebElement e:tr_tag) {
-                if(e.getText().startsWith("00") && e.getText().split(" ")[3].startsWith("受試者費")) {
-
-                    // 如果找到到帳日為上個月份，跳出迴圈
-                    if(e.getText().split(" ")[5].startsWith(lastMonth))
-                        break outer;
-
-                    else if(!e.getText().split(" ")[5].startsWith(thisMoth) || (e.getText().split(" ").length < 10))
-                        continue;
-
-                    list.add(e.getText());
-                    System.out.println(e.getText());
-                }
-            }
-            WebElement nextPage = driver.findElement(By.linkText("下一頁"));
-            nextPage.click();
-        }
-
-        return list;
-    }
-
-    public static List<String> browser_funding(WebDriver driver, String thisMonth, String lastMonth) throws InterruptedException, IOException {
         //  移動到報帳管理/計畫經費報帳
-        driver.navigate().to("https://ntuacc.cc.ntu.edu.tw/acc/apply/list.asp");
+        driver.navigate().to("https://ntuacc.cc.ntu.edu.tw/acc/apply/list.asp?yearchoose="+targetYear);
 
         // List to return
         var list = new ArrayList<String>();
@@ -158,7 +129,7 @@ public class Crawler {
             for(int i = 0; i < plans.size(); i++) {
 //                if(plans.get(i).getText().startsWith("110T217C570"))
 //                    continue;
-                if(plans.get(i).getText().startsWith("110T")) {
+                if(plans.get(i).getText().startsWith(targetYear+"T")) {
                     StringBuilder sb = new StringBuilder();
 
                     for(String s:plans.get(i).getText().split(" ")) {
@@ -177,11 +148,19 @@ public class Crawler {
                     Actions act = new Actions(driver);
                     act.doubleClick(plans.get(i)).perform();
                     String nameInfo = driver.findElement(By.xpath("/html/body/center/center/table[1]/tbody/tr[2]/td[2]")).getText();
-                    sb.append(nameInfo);
+                    for(char c:nameInfo.toCharArray()) {
+                        if(c != ' ')
+                            sb.append(c);
+                    }
                     // 以上為與 js 互動的 part
+
+                    // 如果是受試者費，儲存稅前的金額
+                    if(sb.toString().contains("受試者費"))
+                        sb.append(" ").append(driver.findElement(By.xpath("/html/body/center/center/table[1]/tbody/tr[2]/td[3]")).getText());
 
                     // 存入 list
                     list.add(sb.toString());
+
                     System.out.println(sb);
                     driver.findElement(By.name("back")).click();
 
@@ -190,8 +169,15 @@ public class Crawler {
                 }
             }
 
-            WebElement nextPage = driver.findElement(By.linkText("下一頁"));
-            nextPage.click();
+            try {
+                WebElement nextPage = driver.findElement(By.linkText("下一頁"));
+                nextPage.click();
+            }
+
+            catch(RuntimeException e) {
+                System.out.println("End");
+                break;
+            }
         }
 
         Thread.sleep(1000);
@@ -207,9 +193,16 @@ public class Crawler {
         Cell title_cell = title_row.createCell(0);
 
         // Set up the header
-        String headers[] = new String[]{"出納組編號","報帳條碼","科目代碼","說明", "金額", "到帳日", "目前狀態", "傳票號碼", "付款資料", "列印次數"};
+        String headers[] = new String[]{"報帳條碼","經費或計畫名稱","計畫代碼", "經費別", "金額", "報帳日", "傳票號碼", "付款資料", "報帳ID", "列印次數", "受款人", "備註", "稅前金額"};
         Row header_row = first.createRow(1);
         header_row.setHeight((short)(20*24));
+
+        // 只留有稅錢金額的 data
+        var experimentList = new ArrayList<String>();
+        for(String s:list) {
+            if(s.split(" ").length == headers.length)
+                experimentList.add(s);
+        }
 
         //建立單元格的 顯示樣式
         CellStyle style = wb.createCellStyle();
@@ -232,24 +225,24 @@ public class Crawler {
         }
 
         // Fill in the data
-        for(int i=0;i< list.size();i++){
+        for(int i=0;i< experimentList.size();i++){
             Row row = first.createRow(i+2);
             row.setHeight((short)(20*20)); //設定行高  基數為20
-            for(int j=0;j<list.get(i).split(" ").length;j++){
+            for(int j=0;j<experimentList.get(i).split(" ").length;j++){
                 Cell cell = row.createCell(j);
-                cell.setCellValue(list.get(i).split(" ")[j]);
+                cell.setCellValue(experimentList.get(i).split(" ")[j]);
             }
         }
     }
 
     // Second sheet
-    public static void buildSheet2(List<String> list, Sheet second) {
+    public static void buildSheet2(List<String> list, Sheet second, Sheet first) {
         // Sheet2 title
         Row title_row = second.createRow(0);
         title_row.setHeight((short)(40*20));
         Cell title_cell = title_row.createCell(0);
 
-        String headers[] = new String[]{"報帳條碼","經費或計畫名稱","計畫代碼", "經費別", "金額", "報帳日", "傳票號碼", "付款資料", "報帳ID", "列印次數", "受款人", "備註"};
+        String headers[] = new String[]{"報帳條碼","經費或計畫名稱","計畫代碼", "經費別", "金額", "報帳日", "傳票號碼", "付款資料", "報帳ID", "列印次數", "受款人", "備註", "金額"};
         Row header_row = second.createRow(1);
         header_row.setHeight((short)(20*24));
 
@@ -301,7 +294,7 @@ public class Crawler {
 
         var barCode = new ArrayList<String>();
         for(int i = 2; first.getRow(i) != null; i++)
-            barCode.add(first.getRow(i).getCell(1).getStringCellValue());
+            barCode.add(first.getRow(i).getCell(0).getStringCellValue());
 
         int targetRow = 1;
         for(int i = 2; second.getRow(i) != null; i++) {
@@ -320,7 +313,7 @@ public class Crawler {
     }
 
     public static void buildSheet4(Sheet first, Sheet third, Sheet fourth) {
-        String[] header = {"彥茹", "欣蓉", "彥匡", "宇安", "昀安", "宇昕", "林懿", "品程"};
+        String[] header = {"彥茹", "欣蓉", "彥匡", "宇安", "昀安", "宇昕", "林懿", "品程", "Yaron"};
         Row header_row = fourth.createRow(0);
         header_row.setHeight((short)(20*24));
 
@@ -354,8 +347,8 @@ public class Crawler {
             // 抓 first sheet，第二個 row 以後的資料
             for(int j = 2; first.getRow(j) != null; j++) {
                 Cell target = fourth.getRow(rowNum[i]).getCell(i);
-                String name = first.getRow(j).getCell(3).getStringCellValue();
-                String money = first.getRow(j).getCell(4).getStringCellValue();
+                String name = first.getRow(j).getCell(11).getStringCellValue();
+                String money = first.getRow(j).getCell(12).getStringCellValue();
                 if(name.contains(header[i])) {
                     target.setCellValue(money);
                     rowNum[i]++;
